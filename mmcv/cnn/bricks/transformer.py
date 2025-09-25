@@ -16,6 +16,7 @@ from mmcv.utils import (ConfigDict, build_from_cfg, deprecated_api_warning,
 from .drop import build_dropout
 from .registry import (ATTENTION, FEEDFORWARD_NETWORK, POSITIONAL_ENCODING,
                        TRANSFORMER_LAYER, TRANSFORMER_LAYER_SEQUENCE)
+from quant.Quant import LinearQ , ActQ
 
 # Avoid BC-breaking of importing MultiScaleDeformableAttention from this file
 try:
@@ -589,6 +590,7 @@ class FFN(BaseModule):
                  dropout_layer=None,
                  add_identity=True,
                  init_cfg=None,
+                 nbits=4,
                  **kwargs):
         super().__init__(init_cfg)
         assert num_fcs >= 2, 'num_fcs should be no less ' \
@@ -598,16 +600,35 @@ class FFN(BaseModule):
         self.num_fcs = num_fcs
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
+        self.nbits = nbits
 
         layers = []
         in_channels = embed_dims
         for _ in range(num_fcs - 1):
             layers.append(
                 Sequential(
-                    Linear(in_channels, feedforward_channels), self.activate,
-                    nn.Dropout(ffn_drop)))
+                    # Linear(in_channels, feedforward_channels), self.activate,
+                    # nn.Dropout(ffn_drop)
+                    LinearQ(
+                        in_features=in_channels,
+                        out_features=feedforward_channels,
+                        nbits_w=nbits  # 权重量化位宽
+                    ),
+                    self.activate,  # 激活函数
+                    ActQ(  # 激活量化
+                        in_features=feedforward_channels,
+                        nbits_a=8  # 激活量化位宽
+                    ),
+                    nn.Dropout(ffn_drop)
+                    ))
             in_channels = feedforward_channels
-        layers.append(Linear(feedforward_channels, embed_dims))
+        layers.append(
+            LinearQ(
+                in_features=feedforward_channels,
+                out_features=embed_dims,
+                nbits_w=nbits
+            )
+            )
         layers.append(nn.Dropout(ffn_drop))
         self.layers = Sequential(*layers)
         self.dropout_layer = build_dropout(

@@ -17,6 +17,9 @@ from ...utils import get_root_logger
 from ..builder import BACKBONES
 from ..utils.ckpt_convert import swin_converter
 from ..utils.transformer import PatchEmbed, PatchMerging
+from quant._quan_base_plus import _ActQ
+from quant.Quant import LinearQ , Qmodes , ActQ
+from quant.lsq_plus import ActLSQ , LinearLSQ
 
 
 class WindowMSA(BaseModule):
@@ -46,6 +49,7 @@ class WindowMSA(BaseModule):
                  qk_scale=None,
                  attn_drop_rate=0.,
                  proj_drop_rate=0.,
+                 nbits=4,
                  init_cfg=None):
 
         super().__init__()
@@ -55,6 +59,7 @@ class WindowMSA(BaseModule):
         head_embed_dims = embed_dims // num_heads
         self.scale = qk_scale or head_embed_dims**-0.5
         self.init_cfg = init_cfg
+        self.nbits = nbits
 
         # define a parameter table of relative position bias
         self.relative_position_bias_table = nn.Parameter(
@@ -68,15 +73,61 @@ class WindowMSA(BaseModule):
         rel_position_index = rel_position_index.flip(1).contiguous()
         self.register_buffer('relative_position_index', rel_position_index)
 
-        self.qkv = nn.Linear(embed_dims, embed_dims * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop_rate)
-        self.proj = nn.Linear(embed_dims, embed_dims)
-        self.proj_drop = nn.Dropout(proj_drop_rate)
+        '''
+        替换为量化线性层
+        '''
+        # QKV投影层：使用量化线性层（输出维度为3*embed_dims）
+        self.qkv = LinearQ(
+            in_features=embed_dims,
+            out_features=embed_dims * 3,
+            bias=qkv_bias,
+            nbits=nbits,
+            mode=Qmodes.layer_wise  # 层级量化
+        )
 
+        # 输出投影层：量化线性层
+        self.proj = LinearQ(
+            in_features=embed_dims,
+            out_features=embed_dims,
+            bias=True,
+            nbits=nbits,
+            mode=Qmodes.layer_wise
+        )
+        '''
+        添加激活量化组件
+        '''
+        self.q_act = ActQ(in_features=head_embed_dims, nbits=8, mode=Qmodes.layer_wise)  # Q激活量化
+        self.k_act = ActQ(in_features=head_embed_dims, nbits=8, mode=Qmodes.layer_wise)  # K激活量化
+        self.v_act = ActQ(in_features=head_embed_dims, nbits=8, mode=Qmodes.layer_wise)  # V激活量化
+        self.attn_act = ActQ(in_features=num_heads, nbits=8, mode=Qmodes.layer_wise)  # 注意力权重量化
+
+        # 其他行保持不变
+        self.attn_drop = nn.Dropout(attn_drop_rate)
+        self.proj_drop = nn.Dropout(proj_drop_rate)
         self.softmax = nn.Softmax(dim=-1)
+
+        # self.qkv = nn.Linear(embed_dims, embed_dims * 3, bias=qkv_bias)
+        # self.attn_drop = nn.Dropout(attn_drop_rate)
+        # self.proj = nn.Linear(embed_dims, embed_dims)
+        # self.proj_drop = nn.Dropout(proj_drop_rate)
+
+        # self.softmax = nn.Softmax(dim=-1)
 
     def init_weights(self):
         trunc_normal_(self.relative_position_bias_table, std=0.02)
+        # 初始化量化层参数（参考QuantMultiheadAttention的_reset_parameters）
+        for m in self.modules():
+            if isinstance(m, LinearQ):
+                # 量化线性权重初始化
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0.)
+            elif isinstance(m, ActQ):
+                # 激活量化参数初始化
+                if m.alpha is not None:
+                    torch.nn.init.ones_(m.alpha)  # 缩放因子初始化为1
+                if m.zero_point is not None:
+                    torch.nn.init.zeros_(m.zero_point)  # 零点初始化为0
 
     def forward(self, x, mask=None):
         """
@@ -91,6 +142,13 @@ class WindowMSA(BaseModule):
                                   C // self.num_heads).permute(2, 0, 3, 1, 4)
         # make torchscript happy (cannot use tensor as tuple)
         q, k, v = qkv[0], qkv[1], qkv[2]
+
+        '''
+        激活量化
+        '''
+        q = self.q_act(q) 
+        k = self.k_act(k)  
+        v = self.v_act(v)  
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
@@ -109,6 +167,7 @@ class WindowMSA(BaseModule):
             attn = attn.view(B // nW, nW, self.num_heads, N,
                              N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
+        attn = self.attn_act(attn)      #注意力权重量化
         attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
