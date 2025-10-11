@@ -78,9 +78,9 @@ class MTL(BaseModule):
                 if isinstance(attn, MultiScaleDeformableAttention):
                     attn.init_weights()
 
-    def extract_feat(self, img):
+    def extract_feat(self, img, task=0):
         """Directly extract features from the backbone+neck."""
-        backbone_feature = self.backbone(img)
+        backbone_feature = self.backbone(img, task=task)
         neck_feature = self.neck(backbone_feature[-3:])
         return neck_feature, backbone_feature
 
@@ -119,7 +119,8 @@ class MTL(BaseModule):
     def forward_train_cls(self, img, gt_label, **kwargs):
         if self.cls_augments is not None:
             img, gt_label = self.cls_augments(img, gt_label)
-        neck_feature, backbone_feature = self.extract_feat(img)
+        task=0
+        neck_feature, backbone_feature = self.extract_feat(img, task=task)
         losses = dict()
         loss = self.cls_head.forward_train(
             neck_feature, backbone_feature, gt_label, self.shared_encoder)
@@ -128,17 +129,19 @@ class MTL(BaseModule):
 
     def forward_train_det(self, img, img_metas, gt_bboxes, gt_labels,
                           gt_bboxes_ignore=None):
+        task=1
         batch_input_shape = tuple(img[0].size()[-2:])
         for img_meta in img_metas:
             img_meta['batch_input_shape'] = batch_input_shape
-        x = self.extract_feat(img)[0]
+        x = self.extract_feat(img,task=task)[0]
         losses = self.bbox_head.forward_train(x, img_metas, gt_bboxes,
                                               gt_labels, gt_bboxes_ignore,
                                               self.shared_encoder)
         return losses
 
     def forward_train_seg(self, img, img_metas, gt_semantic_seg):
-        neck_feature, backbone_feature = self.extract_feat(img)
+        task=2
+        neck_feature, backbone_feature = self.extract_feat(img,task=task)
         losses = dict()
         loss_decode = self.seg_head.forward_train(
             neck_feature, backbone_feature, img_metas,

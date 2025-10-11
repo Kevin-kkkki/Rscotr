@@ -77,29 +77,29 @@ class WindowMSA(BaseModule):
         替换为量化线性层
         '''
         # QKV投影层：使用量化线性层（输出维度为3*embed_dims）
-        self.qkv = LinearQ(
+        self.qkv = LinearLSQ(
             in_features=embed_dims,
             out_features=embed_dims * 3,
             bias=qkv_bias,
-            nbits=nbits,
+            #nbits=nbits,
             mode=Qmodes.layer_wise  # 层级量化
         )
 
         # 输出投影层：量化线性层
-        self.proj = LinearQ(
+        self.proj = LinearLSQ(
             in_features=embed_dims,
             out_features=embed_dims,
             bias=True,
-            nbits=nbits,
+            #nbits=nbits,
             mode=Qmodes.layer_wise
         )
         '''
         添加激活量化组件
         '''
-        self.q_act = ActQ(in_features=head_embed_dims, nbits=8, mode=Qmodes.layer_wise)  # Q激活量化
-        self.k_act = ActQ(in_features=head_embed_dims, nbits=8, mode=Qmodes.layer_wise)  # K激活量化
-        self.v_act = ActQ(in_features=head_embed_dims, nbits=8, mode=Qmodes.layer_wise)  # V激活量化
-        self.attn_act = ActQ(in_features=num_heads, nbits=8, mode=Qmodes.layer_wise)  # 注意力权重量化
+        self.q_act = ActLSQ(in_features=head_embed_dims, mode=Qmodes.layer_wise)  # Q激活量化
+        self.k_act = ActLSQ(in_features=head_embed_dims, mode=Qmodes.layer_wise)  # K激活量化
+        self.v_act = ActLSQ(in_features=head_embed_dims, mode=Qmodes.layer_wise)  # V激活量化
+        self.attn_act = ActLSQ(in_features=num_heads, mode=Qmodes.layer_wise)  # 注意力权重量化
 
         # 其他行保持不变
         self.attn_drop = nn.Dropout(attn_drop_rate)
@@ -129,7 +129,7 @@ class WindowMSA(BaseModule):
                 if m.zero_point is not None:
                     torch.nn.init.zeros_(m.zero_point)  # 零点初始化为0
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, task=None):
         """
         Args:
 
@@ -138,7 +138,7 @@ class WindowMSA(BaseModule):
                 Wh*Ww, Wh*Ww), value should be between (-inf, 0].
         """
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
+        qkv = self.qkv(x, task=task).reshape(B, N, 3, self.num_heads,
                                   C // self.num_heads).permute(2, 0, 3, 1, 4)
         # make torchscript happy (cannot use tensor as tuple)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -146,9 +146,9 @@ class WindowMSA(BaseModule):
         '''
         激活量化
         '''
-        q = self.q_act(q) 
-        k = self.k_act(k)  
-        v = self.v_act(v)  
+        q = self.q_act(q, task=task) 
+        k = self.k_act(k, task=task)  
+        v = self.v_act(v, task=task)  
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
@@ -167,13 +167,13 @@ class WindowMSA(BaseModule):
             attn = attn.view(B // nW, nW, self.num_heads, N,
                              N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
-        attn = self.attn_act(attn)      #注意力权重量化
+        attn = self.attn_act(attn, task=task)      #注意力权重量化
         attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
+        x = self.proj(x, task=task)
         x = self.proj_drop(x)
         return x
 
@@ -236,7 +236,7 @@ class ShiftWindowMSA(BaseModule):
 
         self.drop = build_dropout(dropout_layer)
 
-    def forward(self, query, hw_shape):
+    def forward(self, query, hw_shape, task):
         B, L, C = query.shape
         H, W = hw_shape
         assert L == H * W, 'input feature has wrong size'
@@ -287,7 +287,7 @@ class ShiftWindowMSA(BaseModule):
         query_windows = query_windows.view(-1, self.window_size**2, C)
 
         # W-MSA/SW-MSA (nW*B, window_size*window_size, C)
-        attn_windows = self.w_msa(query_windows, mask=attn_mask)
+        attn_windows = self.w_msa(query_windows, mask=attn_mask, task=task)
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size,
@@ -414,12 +414,12 @@ class SwinBlock(BaseModule):
             add_identity=True,
             init_cfg=None)
 
-    def forward(self, x, hw_shape):
+    def forward(self, x, hw_shape,task):
 
-        def _inner_forward(x):
+        def _inner_forward(x, task=task):
             identity = x
             x = self.norm1(x)
-            x = self.attn(x, hw_shape)
+            x = self.attn(x, hw_shape, task=task)
 
             x = x + identity
 
@@ -432,7 +432,7 @@ class SwinBlock(BaseModule):
         if self.with_cp and x.requires_grad:
             x = cp.checkpoint(_inner_forward, x)
         else:
-            x = _inner_forward(x)
+            x = _inner_forward(x, task=task)
 
         return x
 
@@ -511,9 +511,9 @@ class SwinBlockSequence(BaseModule):
 
         self.downsample = downsample
 
-    def forward(self, x, hw_shape):
+    def forward(self, x, hw_shape, task):
         for block in self.blocks:
-            x = block(x, hw_shape)
+            x = block(x, hw_shape, task=task)
 
         if self.downsample:
             x_down, down_hw_shape = self.downsample(x, hw_shape)
@@ -801,8 +801,8 @@ class SwinTransformer(BaseModule):
             # load state_dict
             self.load_state_dict(state_dict, False)
 
-    def forward(self, x):
-        x, hw_shape = self.patch_embed(x)
+    def forward(self, x,task):
+        x, hw_shape = self.patch_embed(x, task=task)
 
         if self.use_abs_pos_embed:
             x = x + self.absolute_pos_embed
@@ -810,7 +810,7 @@ class SwinTransformer(BaseModule):
 
         outs = []
         for i, stage in enumerate(self.stages):
-            x, hw_shape, out, out_hw_shape = stage(x, hw_shape)
+            x, hw_shape, out, out_hw_shape = stage(x, hw_shape, task=task)
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 out = norm_layer(out)

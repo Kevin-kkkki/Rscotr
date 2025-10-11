@@ -55,7 +55,7 @@ class Conv2dLSQ(_Conv2dQ):
             nbits=nbits_w, mode=mode)
         self.act = ActLSQ_conv(in_features=in_channels, nbits_a=nbits_w)
 
-    def forward(self, x):
+    def forward(self, x, task):
         if self.alpha is None:
             return F.conv2d(x, self.weight, self.bias, self.stride,
                             self.padding, self.dilation, self.groups)

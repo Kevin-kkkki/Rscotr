@@ -19,6 +19,8 @@ from torch.nn.init import normal_
 
 from mmdet.models.utils.builder import TRANSFORMER
 
+from quant.lsq_plus import Conv2dLSQ
+
 try:
     from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttention
 
@@ -195,15 +197,25 @@ class PatchEmbed(BaseModule):
             self.adap_padding = None
         padding = to_2tuple(padding)
 
-        self.projection = build_conv_layer(
-            dict(type=conv_type),
+        # self.projection = build_conv_layer(
+        #     dict(type=conv_type),
+        #     in_channels=in_channels,
+        #     out_channels=embed_dims,
+        #     kernel_size=kernel_size,
+        #     stride=stride,
+        #     padding=padding,
+        #     dilation=dilation,
+        #     bias=bias)
+        self.projectionLSQ = Conv2dLSQ(
             in_channels=in_channels,
-            out_channels=embed_dims,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            bias=bias)
+             out_channels=embed_dims,
+             kernel_size=kernel_size,
+             stride=stride,
+             padding=padding,
+             dilation=dilation,
+             bias=bias
+             )
+
 
         if norm_cfg is not None:
             self.norm = build_norm_layer(norm_cfg, embed_dims)[1]
@@ -233,7 +245,7 @@ class PatchEmbed(BaseModule):
             self.init_input_size = None
             self.init_out_size = None
 
-    def forward(self, x):
+    def forward(self, x, task=None):
         """
         Args:
             x (Tensor): Has shape (B, C, H, W). In most case, C is 3.
@@ -249,7 +261,7 @@ class PatchEmbed(BaseModule):
         if self.adap_padding:
             x = self.adap_padding(x)
 
-        x = self.projection(x)
+        x = self.projectionLSQ(x, task=task)
         out_size = (x.shape[2], x.shape[3])
         x = x.flatten(2).transpose(1, 2)
         if self.norm is not None:
