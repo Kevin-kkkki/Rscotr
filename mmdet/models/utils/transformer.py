@@ -19,7 +19,8 @@ from torch.nn.init import normal_
 
 from mmdet.models.utils.builder import TRANSFORMER
 
-from quant.lsq_plus import Conv2dLSQ
+from quant.lsq_plus import Conv2dLSQ , ActLSQ
+from quant.Quant import Qmodes
 
 try:
     from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttention
@@ -173,11 +174,13 @@ class PatchEmbed(BaseModule):
         bias=True,
         norm_cfg=None,
         input_size=None,
+        nbits=4,
         init_cfg=None,
     ):
         super(PatchEmbed, self).__init__(init_cfg=init_cfg)
 
         self.embed_dims = embed_dims
+        self.nbits = nbits
         if stride is None:
             stride = kernel_size
 
@@ -215,6 +218,13 @@ class PatchEmbed(BaseModule):
              dilation=dilation,
              bias=bias
              )
+        
+        # 新增：卷积后激活量化
+        self.act_quant = ActLSQ(
+            in_features=embed_dims,  # 输入特征维度为卷积输出通道数
+            mode=Qmodes.layer_wise,  # 层级量化
+            nbits=nbits  # 量化位宽
+        )
 
 
         if norm_cfg is not None:
@@ -245,6 +255,21 @@ class PatchEmbed(BaseModule):
             self.init_input_size = None
             self.init_out_size = None
 
+    # def init_weights(self):
+    #     """初始化量化层参数（继承自BaseModule）"""
+    #     super().init_weights()
+    #     # 初始化量化参数
+    #     if hasattr(self.projectionLSQ, 'init_weights'):
+    #         self.projectionLSQ.init_weights()  # 量化卷积层权重初始化
+    #     if hasattr(self.act_quant, 'init_weights'):
+    #         self.act_quant.init_weights()  # 激活量化参数初始化
+    #     else:
+    #         # 手动初始化激活量化的缩放因子和零点
+    #         if self.act_quant.alpha is not None:
+    #             torch.nn.init.ones_(self.act_quant.alpha)
+    #         if self.act_quant.zero_point is not None:
+    #             torch.nn.init.zeros_(self.act_quant.zero_point)
+
     def forward(self, x, task=None):
         """
         Args:
@@ -262,6 +287,7 @@ class PatchEmbed(BaseModule):
             x = self.adap_padding(x)
 
         x = self.projectionLSQ(x, task=task)
+        x = self.act_quant(x, task=task)  # 卷积后激活量化
         out_size = (x.shape[2], x.shape[3])
         x = x.flatten(2).transpose(1, 2)
         if self.norm is not None:

@@ -81,7 +81,7 @@ class MTL(BaseModule):
     def extract_feat(self, img, task=0):
         """Directly extract features from the backbone+neck."""
         backbone_feature = self.backbone(img, task=task)
-        neck_feature = self.neck(backbone_feature[-3:])
+        neck_feature = self.neck(backbone_feature[-3:] , task)
         return neck_feature, backbone_feature
 
     def forward_train(self, task: str, *args, **kwargs):

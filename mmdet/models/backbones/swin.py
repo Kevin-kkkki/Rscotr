@@ -93,6 +93,12 @@ class WindowMSA(BaseModule):
             #nbits=nbits,
             mode=Qmodes.layer_wise
         )
+
+        self.bias_act = ActLSQ(
+            in_features=self.num_heads,
+            mode=Qmodes.layer_wise,
+            nbits=self.nbits  # 显式用构造函数传入的量化位宽，避免默认值不匹配
+        )
         '''
         添加激活量化组件
         '''
@@ -160,6 +166,7 @@ class WindowMSA(BaseModule):
                 -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(
             2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        relative_position_bias = self.bias_act(relative_position_bias, task=task)  # 量化偏置
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
@@ -286,7 +293,7 @@ class ShiftWindowMSA(BaseModule):
         # nW*B, window_size*window_size, C
         query_windows = query_windows.view(-1, self.window_size**2, C)
 
-        # W-MSA/SW-MSA (nW*B, window_size*window_size, C)
+        # W-MSA/SW-MSA (nW*B, window_size*window_size, C)   只有这个需要量化
         attn_windows = self.w_msa(query_windows, mask=attn_mask, task=task)
 
         # merge windows
@@ -401,6 +408,7 @@ class SwinBlock(BaseModule):
             attn_drop_rate=attn_drop_rate,
             proj_drop_rate=drop_rate,
             dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
+            # task=task,
             init_cfg=None)
 
         self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
@@ -425,10 +433,11 @@ class SwinBlock(BaseModule):
 
             identity = x
             x = self.norm2(x)
-            x = self.ffn(x, identity=identity)
+            x = self.ffn(x, identity=identity,task=task)
 
             return x
 
+        # 检查是否使用梯度检查点
         if self.with_cp and x.requires_grad:
             x = cp.checkpoint(_inner_forward, x)
         else:
@@ -512,9 +521,11 @@ class SwinBlockSequence(BaseModule):
         self.downsample = downsample
 
     def forward(self, x, hw_shape, task):
+        # 依次通过每一个SwinBlock
         for block in self.blocks:
             x = block(x, hw_shape, task=task)
 
+        # 如果有下采样快，则执行下采样块
         if self.downsample:
             x_down, down_hw_shape = self.downsample(x, hw_shape)
             return x_down, down_hw_shape, x, hw_shape
@@ -810,7 +821,7 @@ class SwinTransformer(BaseModule):
 
         outs = []
         for i, stage in enumerate(self.stages):
-            x, hw_shape, out, out_hw_shape = stage(x, hw_shape, task=task)
+            x, hw_shape, out, out_hw_shape = stage(x, hw_shape , task = task)
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 out = norm_layer(out)

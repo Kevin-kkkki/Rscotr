@@ -17,6 +17,7 @@ from .drop import build_dropout
 from .registry import (ATTENTION, FEEDFORWARD_NETWORK, POSITIONAL_ENCODING,
                        TRANSFORMER_LAYER, TRANSFORMER_LAYER_SEQUENCE)
 from quant.Quant import LinearQ , ActQ
+from quant.lsq_plus import LinearLSQ,ActLSQ
 
 # Avoid BC-breaking of importing MultiScaleDeformableAttention from this file
 try:
@@ -609,13 +610,13 @@ class FFN(BaseModule):
                 Sequential(
                     # Linear(in_channels, feedforward_channels), self.activate,
                     # nn.Dropout(ffn_drop)
-                    LinearQ(
+                    LinearLSQ(
                         in_features=in_channels,
                         out_features=feedforward_channels,
                         nbits_w=nbits  # 权重量化位宽
                     ),
                     self.activate,  # 激活函数
-                    ActQ(  # 激活量化
+                    ActLSQ(  # 激活量化
                         in_features=feedforward_channels,
                         nbits_a=8  # 激活量化位宽
                     ),
@@ -623,7 +624,7 @@ class FFN(BaseModule):
                     ))
             in_channels = feedforward_channels
         layers.append(
-            LinearQ(
+            LinearLSQ(
                 in_features=feedforward_channels,
                 out_features=embed_dims,
                 nbits_w=nbits
@@ -636,12 +637,29 @@ class FFN(BaseModule):
         self.add_identity = add_identity
 
     @deprecated_api_warning({'residual': 'identity'}, cls_name='FFN')
-    def forward(self, x, identity=None):
+    def forward(self, x, task, identity=None):
         """Forward function for `FFN`.
 
         The function would add x to the output tensor if residue is None.
         """
-        out = self.layers(x)
+        # 想办法把task传输到FFN中
+        #out = self.layers(x)
+        for layer in self.layers:
+            # 如果该层是 Sequential，继续向下递归
+            if isinstance(layer, nn.Sequential):
+                for sublayer in layer:
+                    if hasattr(sublayer, 'forward') and 'task' in sublayer.forward.__code__.co_varnames:
+                        x = sublayer(x, task=task)
+                    else:
+                        x = sublayer(x)
+            else:
+                if hasattr(layer, 'forward') and 'task' in layer.forward.__code__.co_varnames:
+                    x = layer(x, task=task)
+                else:
+                    x = layer(x)
+        out = x
+
+
         if not self.add_identity:
             return self.dropout_layer(out)
         if identity is None:
