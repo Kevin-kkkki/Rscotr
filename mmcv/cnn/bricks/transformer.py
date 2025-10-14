@@ -591,7 +591,6 @@ class FFN(BaseModule):
                  dropout_layer=None,
                  add_identity=True,
                  init_cfg=None,
-                 nbits=4,
                  **kwargs):
         super().__init__(init_cfg)
         assert num_fcs >= 2, 'num_fcs should be no less ' \
@@ -601,35 +600,16 @@ class FFN(BaseModule):
         self.num_fcs = num_fcs
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
-        self.nbits = nbits
 
         layers = []
         in_channels = embed_dims
         for _ in range(num_fcs - 1):
             layers.append(
                 Sequential(
-                    # Linear(in_channels, feedforward_channels), self.activate,
-                    # nn.Dropout(ffn_drop)
-                    LinearLSQ(
-                        in_features=in_channels,
-                        out_features=feedforward_channels,
-                        nbits_w=nbits  # 权重量化位宽
-                    ),
-                    self.activate,  # 激活函数
-                    ActLSQ(  # 激活量化
-                        in_features=feedforward_channels,
-                        nbits_a=8  # 激活量化位宽
-                    ),
-                    nn.Dropout(ffn_drop)
-                    ))
+                    Linear(in_channels, feedforward_channels), self.activate,
+                    nn.Dropout(ffn_drop)))
             in_channels = feedforward_channels
-        layers.append(
-            LinearLSQ(
-                in_features=feedforward_channels,
-                out_features=embed_dims,
-                nbits_w=nbits
-            )
-            )
+        layers.append(Linear(feedforward_channels, embed_dims))
         layers.append(nn.Dropout(ffn_drop))
         self.layers = Sequential(*layers)
         self.dropout_layer = build_dropout(
@@ -637,29 +617,12 @@ class FFN(BaseModule):
         self.add_identity = add_identity
 
     @deprecated_api_warning({'residual': 'identity'}, cls_name='FFN')
-    def forward(self, x, task, identity=None):
+    def forward(self, x, identity=None):
         """Forward function for `FFN`.
 
         The function would add x to the output tensor if residue is None.
         """
-        # 想办法把task传输到FFN中
-        #out = self.layers(x)
-        for layer in self.layers:
-            # 如果该层是 Sequential，继续向下递归
-            if isinstance(layer, nn.Sequential):
-                for sublayer in layer:
-                    if hasattr(sublayer, 'forward') and 'task' in sublayer.forward.__code__.co_varnames:
-                        x = sublayer(x, task=task)
-                    else:
-                        x = sublayer(x)
-            else:
-                if hasattr(layer, 'forward') and 'task' in layer.forward.__code__.co_varnames:
-                    x = layer(x, task=task)
-                else:
-                    x = layer(x)
-        out = x
-
-
+        out = self.layers(x)
         if not self.add_identity:
             return self.dropout_layer(out)
         if identity is None:

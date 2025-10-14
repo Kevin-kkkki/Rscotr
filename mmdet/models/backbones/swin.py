@@ -433,7 +433,7 @@ class SwinBlock(BaseModule):
 
             identity = x
             x = self.norm2(x)
-            x = self.ffn(x, identity=identity,task=task)
+            x = self.ffn(x, identity=identity)
 
             return x
 
@@ -813,7 +813,7 @@ class SwinTransformer(BaseModule):
             self.load_state_dict(state_dict, False)
 
     def forward(self, x,task):
-        x, hw_shape = self.patch_embed(x, task=task)
+        x, hw_shape = self.patch_embed(x, task)
 
         if self.use_abs_pos_embed:
             x = x + self.absolute_pos_embed
