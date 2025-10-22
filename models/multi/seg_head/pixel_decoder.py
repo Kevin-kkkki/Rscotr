@@ -9,6 +9,8 @@ from mmcv.runner import BaseModule, ModuleList
 
 from mmdet.core.anchor import MlvlPointGenerator
 
+from quant.lsq_plus import Conv2dLSQ
+
 
 @PLUGIN_LAYERS.register_module()
 class MlvlSegPixelDecoder(BaseModule):
@@ -35,7 +37,6 @@ class MlvlSegPixelDecoder(BaseModule):
         # high resolution to low resolution
         self.level_encoding = nn.Embedding(self.num_encoder_levels,
                                            feat_channels)
-
         # fpn-like structure
         self.lateral_convs = ModuleList()
         self.output_convs = ModuleList()
@@ -63,8 +64,19 @@ class MlvlSegPixelDecoder(BaseModule):
             self.lateral_convs.append(lateral_conv)
             self.output_convs.append(output_conv)
 
-        self.mask_feature = Conv2d(
-            feat_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        # self.mask_feature = Conv2d(
+        #     feat_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        # 修改后
+        self.mask_feature = Conv2dLSQ(
+            feat_channels, 
+            out_channels, 
+            kernel_size=1, 
+            stride=1, 
+            padding=0,
+            nbits=8,  # 量化比特数，根据需求调整
+            # 其他量化相关参数（如是否有符号、缩放因子初始化方式等，按需添加）
+        )
+
 
         self.num_outs = num_outs
         self.point_generator = MlvlPointGenerator(strides)
@@ -77,7 +89,7 @@ class MlvlSegPixelDecoder(BaseModule):
         caffe2_xavier_init(self.mask_feature, bias=0)
         normal_init(self.level_encoding, mean=0, std=1)
 
-    def forward(self, encoder, neck_feats, backbone_feats):
+    def forward(self, encoder, neck_feats, backbone_feats, task):
         batch_size = backbone_feats[0].shape[0]
         encoder_input_list = []
         padding_mask_list = []
@@ -143,7 +155,8 @@ class MlvlSegPixelDecoder(BaseModule):
             spatial_shapes=spatial_shapes,
             reference_points=reference_points,
             level_start_index=level_start_index,
-            valid_radios=valid_radios)
+            valid_radios=valid_radios,
+            task=task)
         # (num_total_query, batch_size, c) -> (batch_size, c, num_total_query)
         memory = memory.permute(1, 2, 0)
 
@@ -167,5 +180,5 @@ class MlvlSegPixelDecoder(BaseModule):
             outs.append(y)
         multi_scale_features = outs[:self.num_outs]
 
-        mask_feature = self.mask_feature(outs[-1])
+        mask_feature = self.mask_feature(outs[-1], task=task)
         return mask_feature, multi_scale_features

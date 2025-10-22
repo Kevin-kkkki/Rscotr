@@ -4,6 +4,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import Sequential
 from mmcv.cnn import Conv2d, build_plugin_layer, caffe2_xavier_init
 from mmcv.cnn.bricks.transformer import (build_positional_encoding,
                                          build_transformer_layer_sequence)
@@ -11,8 +12,21 @@ from mmcv.runner import ModuleList
 
 from mmseg.models.builder import HEADS, build_loss
 from mmseg.models.decode_heads.decode_head import BaseDecodeHead
+from quant.lsq_plus import LinearLSQ
+from quant.Quant import Qmodes
 
 
+# 定义仅向LinearLSQ传递task参数的容器
+class LinearLSQSequential(Sequential):
+    def forward(self, input, **kwargs):
+        for module in self:
+            # 仅当模块是LinearLSQ时才传递task参数
+            if isinstance(module, LinearLSQ):
+                input = module(input,** kwargs)
+            else:
+                # ReLU等其他层不接收task参数
+                input = module(input)
+        return input
 
 @HEADS.register_module()
 class Mask2FormerHead(BaseDecodeHead):
@@ -76,11 +90,28 @@ class Mask2FormerHead(BaseDecodeHead):
                                         feat_channels)
 
         if self.scheme == 1:
-            self.cls_embed = nn.Linear(feat_channels, self.num_classes + 1)
-        self.mask_embed = nn.Sequential(
-            nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
-            nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
-            nn.Linear(feat_channels, out_channels))
+            # self.cls_embed = nn.Linear(feat_channels, self.num_classes + 1)
+            # 修改后
+            self.cls_embed = LinearLSQ(
+                in_features=feat_channels,
+                out_features=self.num_classes + 1,
+                nbits=4,  # 量化比特数，根据需求调整（如4/8/16等）
+                mode=Qmodes.layer_wise
+                # 其他量化参数（如signed、scale_init等，按需添加）
+            )
+        # self.mask_embed = nn.Sequential(
+        #     nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
+        #     nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
+        #     nn.Linear(feat_channels, out_channels))
+        # 替换mask_embed的定义
+        self.mask_embed = LinearLSQSequential(
+            LinearLSQ(feat_channels, feat_channels, nbits=4, mode=Qmodes.layer_wise),  # 第一个量化线性层
+            nn.ReLU(inplace=True),
+            LinearLSQ(feat_channels, feat_channels, nbits=4, mode=Qmodes.layer_wise),  # 第二个量化线性层
+            nn.ReLU(inplace=True),
+            LinearLSQ(feat_channels, out_channels, nbits=4, mode=Qmodes.layer_wise)    # 第三个量化线性层
+        )
+
 
         if isinstance(loss_decode, dict):
             self.loss_decode = build_loss(loss_decode)
@@ -108,16 +139,16 @@ class Mask2FormerHead(BaseDecodeHead):
             if p.dim() > 1:
                 nn.init.xavier_normal_(p)
 
-    def forward_head(self, decoder_out, mask_feature, attn_mask_target_size):
+    def forward_head(self, decoder_out, mask_feature, attn_mask_target_size, task):
         decoder_out = self.transformer_decoder.post_norm(decoder_out)
         decoder_out = decoder_out.transpose(0, 1)
         # shape (num_queries, batch_size, c)
-        mask_embed = self.mask_embed(decoder_out)
+        mask_embed = self.mask_embed(decoder_out, task=task)
         # shape (num_queries, batch_size, h, w)
         mask_pred = torch.einsum('bqd,bdhw->bqhw', mask_embed, mask_feature)
         if self.scheme == 1:
             # shape (num_queries, batch_size, c)
-            cls_pred = self.cls_embed(decoder_out)
+            cls_pred = self.cls_embed(decoder_out, task=task)
             seg_mask = torch.einsum('bqc,bqhw->bchw', cls_pred, mask_pred)
         elif self.scheme == 2:
             seg_mask = mask_pred
@@ -138,11 +169,11 @@ class Mask2FormerHead(BaseDecodeHead):
         # return cls_pred, mask_pred, attn_mask  # instance segmentation
         return seg_mask, attn_mask
 
-    def forward(self, encoder, neck_feats, backbone_feats, img_metas):
+    def forward(self, encoder, neck_feats, backbone_feats, img_metas, task):
         batch_size = len(img_metas)
         mask_features, multi_scale_memorys = self.pixel_decoder(
-            encoder, neck_feats, backbone_feats)
-        # multi_scale_memorys (from low resolution to high resolution)
+            encoder, neck_feats, backbone_feats, task=task)
+        # multi_scale_memorys (from low resolution to high ressolution)
         decoder_inputs = []
         decoder_positional_encodings = []
         for i in range(self.num_transformer_feat_level):
@@ -168,7 +199,7 @@ class Mask2FormerHead(BaseDecodeHead):
             (1, batch_size, 1))
 
         mask_pred, attn_mask = self.forward_head(
-            query_feat, mask_features, multi_scale_memorys[0].shape[-2:])
+            query_feat, mask_features, multi_scale_memorys[0].shape[-2:], task=task)
         mask_pred_list = [mask_pred]
 
         for i in range(self.num_transformer_decoder_layers):
@@ -189,21 +220,22 @@ class Mask2FormerHead(BaseDecodeHead):
                 attn_masks=attn_masks,
                 query_key_padding_mask=None,
                 # here we do not apply masking on padded region
-                key_padding_mask=None)
+                key_padding_mask=None,
+                task=task)
             mask_pred, attn_mask = self.forward_head(
                 query_feat, mask_features, multi_scale_memorys[
-                    (i + 1) % self.num_transformer_feat_level].shape[-2:])
+                    (i + 1) % self.num_transformer_feat_level].shape[-2:], task=task)
 
             mask_pred_list.append(mask_pred)
 
         return mask_pred_list[-1]
 
     def forward_train(self, neck_feats, backbone_feats, img_metas,
-                      gt_semantic_seg, shared_encoder):
-        seg_logits = self.forward(shared_encoder, neck_feats, backbone_feats, img_metas)
+                      gt_semantic_seg, shared_encoder, task):
+        seg_logits = self.forward(shared_encoder, neck_feats, backbone_feats, img_metas, task)
         losses = self.losses(seg_logits, gt_semantic_seg)
         return losses
 
     def forward_test(self, neck_feats, backbone_feats,
-                     img_metas, shared_encoder):
-        return self.forward(shared_encoder, neck_feats, backbone_feats, img_metas)
+                     img_metas, shared_encoder, task):
+        return self.forward(shared_encoder, neck_feats, backbone_feats, img_metas, task=task)

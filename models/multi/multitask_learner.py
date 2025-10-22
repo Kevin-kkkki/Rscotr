@@ -145,7 +145,7 @@ class MTL(BaseModule):
         losses = dict()
         loss_decode = self.seg_head.forward_train(
             neck_feature, backbone_feature, img_metas,
-            gt_semantic_seg, self.shared_encoder)
+            gt_semantic_seg, self.shared_encoder, task=2)
         losses.update(add_prefix(loss_decode, 'seg'))
         return losses
 
@@ -174,7 +174,7 @@ class MTL(BaseModule):
     def whole_inference_seg(self, img, img_meta, rescale):
         neck_feature, backbone_feature = self.extract_feat(img)
         seg_logit = self.seg_head.forward_test(
-            neck_feature, backbone_feature, img_meta, self.shared_encoder)
+            neck_feature, backbone_feature, img_meta, self.shared_encoder, task=2)
         seg_logit = resize(
             input=seg_logit,
             size=img.shape[2:],

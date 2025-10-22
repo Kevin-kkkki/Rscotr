@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from ..builder import HEADS
 from .cls_head import ClsHead
 
+from quant.lsq_plus import LinearLSQ , ActLSQ
+from quant.Quant import Qmodes
+
 
 @HEADS.register_module()
 class LinearClsHead(ClsHead):
@@ -33,11 +36,27 @@ class LinearClsHead(ClsHead):
             raise ValueError(
                 f'num_classes={num_classes} must be a positive integer')
 
-        self.fc = nn.Linear(self.in_channels, self.num_classes)
+        # self.fc = nn.Linear(self.in_channels, self.num_classes)
+        # 1. 替换线性层为量化版本（__init__中修改）
+        self.fc = LinearLSQ(
+            in_features=self.in_channels,
+            out_features=self.num_classes,
+            bias=True,  # 与原nn.Linear一致（默认有bias）
+            nbits_w=4,  # 权重量化位宽
+            mode=Qmodes.layer_wise  # 量化模式，与其他量化层保持一致
+        )
+
+        # 2. 新增激活量化层（__init__中添加）
+        self.act_quant = ActLSQ(
+            in_features=self.in_channels,
+            nbits_a=4  # 激活量化位宽，与权重保持一致
+        )
+
 
     def pre_logits(self, x):
         if isinstance(x, tuple):
             x = x[-1]
+        x = self.act_quant(x)
         return x
 
     def simple_test(self, x, softmax=True, post_process=True):
@@ -61,7 +80,7 @@ class LinearClsHead(ClsHead):
                   float and the dimensions are ``(num_samples, num_classes)``.
         """
         x = self.pre_logits(x)
-        cls_score = self.fc(x)
+        cls_score = self.fc(x,task=0)
 
         if softmax:
             pred = (
@@ -76,7 +95,7 @@ class LinearClsHead(ClsHead):
 
     def forward_train(self, x, gt_label, **kwargs):
         x = self.pre_logits(x)
-        cls_score = self.fc(x)
+        cls_score = self.fc(x,task=0)
         losses = self.loss(cls_score, gt_label, **kwargs)
         return losses
 

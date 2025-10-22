@@ -15,6 +15,9 @@ from mmcv.cnn.bricks.registry import ATTENTION
 from mmcv.runner import BaseModule
 from ..utils import ext_loader
 
+from quant.lsq_plus import LinearLSQ , ActLSQ
+from quant.Quant import Qmodes
+
 ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
@@ -224,12 +227,40 @@ class MultiScaleDeformableAttention(BaseModule):
         self.num_levels = num_levels
         self.num_heads = num_heads
         self.num_points = num_points
-        self.sampling_offsets = nn.Linear(
-            embed_dims, num_heads * num_levels * num_points * 2)
-        self.attention_weights = nn.Linear(embed_dims,
-                                           num_heads * num_levels * num_points)
-        self.value_proj = nn.Linear(embed_dims, embed_dims)
-        self.output_proj = nn.Linear(embed_dims, embed_dims)
+
+        # self.sampling_offsets = nn.Linear(
+        #     embed_dims, num_heads * num_levels * num_points * 2)
+        self.sampling_offsets = LinearLSQ(
+            in_features=embed_dims,
+            out_features=num_heads * num_levels * num_points * 2,
+            mode=Qmodes.layer_wise,
+            nbits=4
+        )
+        # self.attention_weights = nn.Linear(embed_dims,
+        #                                    num_heads * num_levels * num_points)
+        self.attention_weights = LinearLSQ(
+            in_features=embed_dims,
+            out_features=num_heads * num_levels * num_points,
+            mode=Qmodes.layer_wise,
+            nbits=4
+        )
+        # self.value_proj = nn.Linear(embed_dims, embed_dims)
+        self.value_proj = LinearLSQ(
+            in_features=embed_dims,
+            out_features=embed_dims,
+            mode=Qmodes.layer_wise,
+            nbits=4
+        )
+        # self.output_proj = nn.Linear(embed_dims, embed_dims)
+        self.output_proj = LinearLSQ(
+            in_features=embed_dims,
+            out_features=embed_dims,
+            mode=Qmodes.layer_wise,
+            nbits=4
+        )
+        # 激活量化层
+        self.act_q = ActLSQ(in_features=embed_dims,nbits=4, mode=Qmodes.layer_wise)
+        self.attn_act_q = ActLSQ(in_features=embed_dims,nbits=4, mode=Qmodes.layer_wise)
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -246,7 +277,10 @@ class MultiScaleDeformableAttention(BaseModule):
         for i in range(self.num_points):
             grid_init[:, :, i, :] *= i + 1
 
-        self.sampling_offsets.bias.data = grid_init.view(-1)
+        # self.sampling_offsets.bias.data = grid_init.view(-1)
+        # 初始化量化线性层的偏置
+        if self.sampling_offsets.bias is not None:
+            self.sampling_offsets.bias.data = grid_init.view(-1)
         constant_init(self.attention_weights, val=0., bias=0.)
         xavier_init(self.value_proj, distribution='uniform', bias=0.)
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
@@ -265,6 +299,7 @@ class MultiScaleDeformableAttention(BaseModule):
                 reference_points: Optional[torch.Tensor] = None,
                 spatial_shapes: Optional[torch.Tensor] = None,
                 level_start_index: Optional[torch.Tensor] = None,
+                task=None,
                 **kwargs) -> torch.Tensor:
         """Forward Function of MultiScaleDeformAttention.
 
@@ -317,14 +352,20 @@ class MultiScaleDeformableAttention(BaseModule):
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
-        value = self.value_proj(value)
+        value = self.value_proj(value, task=task)              # 可以量化
+        value = self.act_q(value, task=task)                           #激活量化
+
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
-        sampling_offsets = self.sampling_offsets(query).view(
+
+        sampling_offsets = self.sampling_offsets(query, task=task).view(               #可以量化
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
-        attention_weights = self.attention_weights(query).view(
+        sampling_offsets = self.act_q(sampling_offsets, task=task)                             #激活量化
+        
+        attention_weights = self.attention_weights(query, task=task).view(             #可以量化
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
+        attention_weights = self.attn_act_q(attention_weights, task=task)  # 激活量化
         attention_weights = attention_weights.softmax(-1)
 
         attention_weights = attention_weights.view(bs, num_query,
@@ -354,7 +395,8 @@ class MultiScaleDeformableAttention(BaseModule):
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
 
-        output = self.output_proj(output)
+        output = self.output_proj(output, task=task)           #需要量化
+        output = self.act_q(output, task=task)  # 激活量化
 
         if not self.batch_first:
             # (num_query, bs ,embed_dims)

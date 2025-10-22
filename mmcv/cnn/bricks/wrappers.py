@@ -13,6 +13,9 @@ from torch.nn.modules.utils import _pair, _triple
 
 from .registry import CONV_LAYERS, UPSAMPLE_LAYERS
 
+from quant.lsq_plus import LinearLSQ , ActLSQ
+from quant.Quant import Qmodes
+
 if torch.__version__ == 'parrots':
     TORCH_VERSION = torch.__version__
 else:
@@ -161,7 +164,6 @@ class MaxPool3d(nn.MaxPool3d):
             return empty
 
         return super().forward(x)
-
 
 class Linear(torch.nn.Linear):
 

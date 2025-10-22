@@ -19,7 +19,7 @@ from torch.nn.init import normal_
 
 from mmdet.models.utils.builder import TRANSFORMER
 
-from quant.lsq_plus import Conv2dLSQ , ActLSQ
+from quant.lsq_plus import Conv2dLSQ , ActLSQ ,LinearLSQ
 from quant.Quant import Qmodes
 
 try:
@@ -508,13 +508,13 @@ class DetrTransformerEncoder(TransformerLayerSequence):
                                       f'Please specify post_norm_cfg'
             self.post_norm = None
 
-    def forward(self, *args, **kwargs):
+    def forward(self,task, *args, **kwargs):
         """Forward function for `TransformerCoder`.
 
         Returns:
             Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
-        x = super(DetrTransformerEncoder, self).forward(*args, **kwargs)
+        x = super(DetrTransformerEncoder, self).forward(*args, **kwargs , task=task)
         if self.post_norm is not None:
             x = self.post_norm(x)
         return x
@@ -779,6 +779,12 @@ class DeformableDetrTransformer(Transformer):
 
         if self.as_two_stage:
             self.enc_output = nn.Linear(self.embed_dims, self.embed_dims)
+            # self.enc_output = LinearLSQ(
+            #     in_features=self.embed_dims,
+            #     out_features=self.embed_dims,
+            #     nbits=4,
+            #     mode=Qmodes.layer_wise
+            # )
             self.enc_output_norm = nn.LayerNorm(self.embed_dims)
             self.pos_trans = nn.Linear(self.embed_dims * 2,
                                        self.embed_dims * 2)
@@ -799,7 +805,7 @@ class DeformableDetrTransformer(Transformer):
         normal_(self.level_embeds)
 
     def gen_encoder_output_proposals(self, memory, memory_padding_mask,
-                                     spatial_shapes):
+                                     spatial_shapes, task):
         """Generate proposals from encoded memory.
 
         Args:
@@ -862,7 +868,8 @@ class DeformableDetrTransformer(Transformer):
             memory_padding_mask.unsqueeze(-1), float(0))
         output_memory = output_memory.masked_fill(~output_proposals_valid,
                                                   float(0))
-        output_memory = self.enc_output_norm(self.enc_output(output_memory))
+        output_memory = self.enc_output(output_memory)
+        output_memory = self.enc_output_norm(output_memory)  
         return output_memory, output_proposals
 
     @staticmethod

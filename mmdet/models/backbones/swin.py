@@ -433,7 +433,7 @@ class SwinBlock(BaseModule):
 
             identity = x
             x = self.norm2(x)
-            x = self.ffn(x, identity=identity)
+            x = self.ffn(x, identity=identity, task=task)
 
             return x
 

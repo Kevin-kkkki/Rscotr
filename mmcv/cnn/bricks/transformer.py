@@ -16,7 +16,7 @@ from mmcv.utils import (ConfigDict, build_from_cfg, deprecated_api_warning,
 from .drop import build_dropout
 from .registry import (ATTENTION, FEEDFORWARD_NETWORK, POSITIONAL_ENCODING,
                        TRANSFORMER_LAYER, TRANSFORMER_LAYER_SEQUENCE)
-from quant.Quant import LinearQ , ActQ
+from quant.Quant import Qmodes
 from quant.lsq_plus import LinearLSQ,ActLSQ
 
 # Avoid BC-breaking of importing MultiScaleDeformableAttention from this file
@@ -591,43 +591,111 @@ class FFN(BaseModule):
                  dropout_layer=None,
                  add_identity=True,
                  init_cfg=None,
+                 nbits_w=4,
+                 nbits_a=4,
                  **kwargs):
         super().__init__(init_cfg)
         assert num_fcs >= 2, 'num_fcs should be no less ' \
             f'than 2. got {num_fcs}.'
+        
+        self.nbits_w = nbits_w
+        self.nbits_a = nbits_a
+
         self.embed_dims = embed_dims
         self.feedforward_channels = feedforward_channels
         self.num_fcs = num_fcs
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
+        self.add_identity = add_identity
 
+        # layers = []
+        # 不使用 Sequential，改用 ModuleList 存储层，方便手动调用并传递 task
+        self.layers = nn.ModuleList()
+        in_channels = embed_dims
+
+        # 构建量化全连接层序列
         layers = []
         in_channels = embed_dims
         for _ in range(num_fcs - 1):
-            layers.append(
-                Sequential(
-                    Linear(in_channels, feedforward_channels), self.activate,
-                    nn.Dropout(ffn_drop)))
+            quant_fc = LinearLSQ(
+                in_features=in_channels,
+                out_features=feedforward_channels,
+                nbits_w=nbits_w,
+                mode=Qmodes.layer_wise
+            )
+            # 每个子模块包含：量化FC + 激活 + Dropout
+            self.layers.append(nn.ModuleList([
+                quant_fc,
+                self.activate,
+                nn.Dropout(ffn_drop)
+            ]))
             in_channels = feedforward_channels
-        layers.append(Linear(feedforward_channels, embed_dims))
-        layers.append(nn.Dropout(ffn_drop))
-        self.layers = Sequential(*layers)
+
+        # 输出量化层
+        self.output_quant = ActLSQ(
+            in_features=in_channels,
+            nbits_a=nbits_a,
+            mode=Qmodes.layer_wise
+        )
+
+        # 最终输出FC层
+        self.final_fc = LinearLSQ(
+            in_features=feedforward_channels,
+            out_features=embed_dims,
+            nbits_w=nbits_w,
+            mode=Qmodes.layer_wise
+        )
+        self.final_drop = nn.Dropout(ffn_drop)
+
         self.dropout_layer = build_dropout(
             dropout_layer) if dropout_layer else torch.nn.Identity()
-        self.add_identity = add_identity
+
+        
+        # for _ in range(num_fcs - 1):
+        #     layers.append(
+        #         Sequential(
+        #             Linear(in_channels, feedforward_channels), self.activate,
+        #             nn.Dropout(ffn_drop)))
+        #     in_channels = feedforward_channels
+        # layers.append(Linear(feedforward_channels, embed_dims))
+        # layers.append(nn.Dropout(ffn_drop))
+        # self.layers = Sequential(*layers)
+        # self.dropout_layer = build_dropout(
+        #     dropout_layer) if dropout_layer else torch.nn.Identity()
+        # self.add_identity = add_identity
+
 
     @deprecated_api_warning({'residual': 'identity'}, cls_name='FFN')
-    def forward(self, x, identity=None):
+    def forward(self, x, identity=None, task=None):
         """Forward function for `FFN`.
 
         The function would add x to the output tensor if residue is None.
         """
-        out = self.layers(x)
+        out = x
+        # 手动遍历层，显式传递 task 给需要的量化层
+        for layer in self.layers:
+            quant_fc, activate, dropout = layer
+            out = quant_fc(out, task=task)  # 传递 task 给量化FC层
+            out = activate(out)
+            out = dropout(out)
+        
+        # 最终FC层和输出量化
+        out = self.final_fc(out, task=task)  # 传递 task 给最终FC层
+        out = self.final_drop(out)
+        out = self.output_quant(out, task=task)  # 传递 task 给输出量化层
+
         if not self.add_identity:
             return self.dropout_layer(out)
         if identity is None:
             identity = x
         return identity + self.dropout_layer(out)
+
+        # out = self.layers(x)
+        # if not self.add_identity:
+        #     return self.dropout_layer(out)
+        # if identity is None:
+        #     identity = x
+        # return identity + self.dropout_layer(out)
 
 
 @TRANSFORMER_LAYER.register_module()
@@ -769,6 +837,7 @@ class BaseTransformerLayer(BaseModule):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
+                task=None,
                 **kwargs):
         """Forward function for `TransformerDecoderLayer`.
 
@@ -822,7 +891,7 @@ class BaseTransformerLayer(BaseModule):
         for layer in self.operation_order:
             if layer == 'self_attn':
                 temp_key = temp_value = query
-                query = self.attentions[attn_index](
+                query = self.attentions[attn_index](        #已经量化
                     query,
                     temp_key,
                     temp_value,
@@ -831,6 +900,7 @@ class BaseTransformerLayer(BaseModule):
                     key_pos=query_pos,
                     attn_mask=attn_masks[attn_index],
                     key_padding_mask=query_key_padding_mask,
+                    task=task,
                     **kwargs)
                 attn_index += 1
                 identity = query
@@ -839,7 +909,7 @@ class BaseTransformerLayer(BaseModule):
                 query = self.norms[norm_index](query)
                 norm_index += 1
 
-            elif layer == 'cross_attn':
+            elif layer == 'cross_attn':                 #已经量化
                 query = self.attentions[attn_index](
                     query,
                     key,
@@ -849,13 +919,14 @@ class BaseTransformerLayer(BaseModule):
                     key_pos=key_pos,
                     attn_mask=attn_masks[attn_index],
                     key_padding_mask=key_padding_mask,
+                    task=task,
                     **kwargs)
                 attn_index += 1
                 identity = query
 
-            elif layer == 'ffn':
+            elif layer == 'ffn':                        #已经量化
                 query = self.ffns[ffn_index](
-                    query, identity if self.pre_norm else None)
+                    query, identity if self.pre_norm else None, task=task)
                 ffn_index += 1
 
         return query
@@ -898,6 +969,7 @@ class TransformerLayerSequence(BaseModule):
         self.pre_norm = self.layers[0].pre_norm
 
     def forward(self,
+                task,
                 query,
                 key,
                 value,
@@ -942,5 +1014,6 @@ class TransformerLayerSequence(BaseModule):
                 attn_masks=attn_masks,
                 query_key_padding_mask=query_key_padding_mask,
                 key_padding_mask=key_padding_mask,
+                task=task,
                 **kwargs)
         return query

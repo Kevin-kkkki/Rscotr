@@ -153,7 +153,7 @@ class CdnQueryGenerator:
                 known_bbox_[:, 2:] - known_bbox_[:, :2]
 
         m = known_labels_expand.long().to('cuda')
-        input_label_embed = label_enc(m)
+        input_label_embed = label_enc(m , task=1)       #已经量化
         input_bbox_embed = inverse_sigmoid(known_bbox_expand, eps=1e-3)
 
         padding_label = torch.zeros(pad_size, self.hidden_dim).cuda()
